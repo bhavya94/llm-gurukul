@@ -9,8 +9,9 @@ from pathlib import Path
 
 import torch
 from tokenizers import Tokenizer
+from torch.nn import functional as F
 
-from medha.model import Embedding, SelfAttention, attention
+from medha.model import GPT, Config, Embedding, SelfAttention, attention
 from medha.sampler import chances, generate
 from medha.tokenizer import END, character_alphabet, character_ids, merges, train_bpe
 from vak.counts import PairCounts
@@ -26,6 +27,7 @@ TOKENIZER_FILE = RUNS / "tokenizer.json"
 COUNTS_FILE = RUNS / "counts.pt"
 SENTENCE = "Once upon a time, there was a little girl named Lily."
 VOCAB_SIZE = 2_000
+GPT_CONFIG = Config(vocab_size=VOCAB_SIZE, context=128, width=128, heads=4, layers=4)
 SETTINGS = [  # (label, temperature, top_k, top_p): the columns of the table vak write prints
     ("T 0", 0.0, None, None),
     ("T 0.5", 0.5, None, None),
@@ -241,6 +243,58 @@ def _heads(args: argparse.Namespace) -> None:
     print(f"\nThe largest difference: {gaps[0]:.6f} without position, {gaps[1]:.6f} with it.")
 
 
+def _log_shape(part: torch.nn.Module, inputs: tuple, output: torch.Tensor) -> None:
+    """A forward hook: PyTorch calls it each time the part it is attached to has run."""
+    log.info("after %-10s %s", type(part).__name__, tuple(output.shape))
+
+
+def _count(part: torch.nn.Module) -> int:
+    total = 0
+    for weights in part.parameters():
+        total += weights.numel()
+    return total
+
+
+def _model(args: argparse.Namespace) -> None:
+    tokenizer = _load_tokenizer()
+    torch.manual_seed(0)
+    model = GPT(GPT_CONFIG)
+    end = tokenizer.token_to_id(END)
+    ids = [end] + tokenizer.encode("Once upon a time").ids
+    log.info('the end token, then "Once upon a time": %d ids, %s', len(ids), ids)
+    parts = [model.embedding]
+    parts.extend(model.blocks)
+    parts.extend([model.norm, model.head])
+    for part in parts:
+        part.register_forward_hook(_log_shape)
+    with torch.no_grad():
+        logits = model(torch.tensor([ids]))[0]
+
+    vocab, context, width, layers = GPT_CONFIG.vocab_size, GPT_CONFIG.context, GPT_CONFIG.width, GPT_CONFIG.layers
+    block = model.blocks[0]
+    rows = [
+        ("token table, also the head", _count(model.embedding.tokens), f"{vocab:,} x {width}"),
+        ("position table", _count(model.embedding.positions), f"{context} x {width}"),
+        ("  attention in one block", _count(block.attention),
+         f"{width} x {3 * width} + {3 * width} + {width} x {width} + {width}"),
+        ("  MLP in one block", _count(block.mlp),
+         f"{width} x {4 * width} + {4 * width} + {4 * width} x {width} + {width}"),
+        ("  2 LayerNorms in one block", _count(block.norm1) + _count(block.norm2), f"2 x ({width} + {width})"),
+        (f"{layers} blocks", _count(model.blocks), f"{layers} x {_count(block):,}"),
+        ("last LayerNorm", _count(model.norm), f"{width} + {width}"),
+        ("total", _count(model), ""),
+    ]
+    print(f"\nThe weights: {layers} blocks of {GPT_CONFIG.heads} heads, width {width}, a window of {context} tokens")
+    for name, count, by_hand in rows:
+        print(f"  {name:28}{count:>10,}   {by_hand}".rstrip())
+    chances = torch.softmax(logits, dim=-1)
+    losses = F.cross_entropy(logits[:-1], torch.tensor(ids[1:]), reduction="none")
+    print(f'\nUntrained, the likeliest token after " time" has a chance of {float(chances[-1].max()):.5f}; '
+          f"an even chance is 1 / {vocab:,} = {1 / vocab:.5f}.")
+    print(f"The loss on the prompt's {len(losses)} next tokens is {float(losses.mean()):.3f}; an even guess scores "
+          f"ln {vocab:,} = {math.log(vocab):.3f}.")
+
+
 def _write(args: argparse.Namespace) -> None:
     tokenizer = _load_tokenizer()
     if not COUNTS_FILE.exists():
@@ -305,6 +359,8 @@ def main() -> None:
     attend.set_defaults(run=_attention)
     heads = commands.add_parser("heads", help="shapes through many heads; with position, order changes the output")
     heads.set_defaults(run=_heads)
+    model = commands.add_parser("model", help="shapes through the whole GPT, and its weights part by part")
+    model.set_defaults(run=_model)
     write = commands.add_parser("write", help="the chances under each sampler setting, then the decode loop writes")
     write.add_argument("--prompt", default="Once upon a time", help="the text to continue (default: %(default)s)")
     write.add_argument("--tokens", type=_whole_number, default=40, help="the most new tokens (default: %(default)s)")

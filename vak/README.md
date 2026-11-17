@@ -21,7 +21,7 @@ One pull request per step. From step 2 on, each adds one command, one notebook a
 | 5 | Sample: temperature, top-k, top-p, and the loop that writes text | [05-sample.ipynb](05-sample.ipynb) |
 | 6 | One attention head on three tokens | [06-attention.ipynb](06-attention.ipynb) |
 | 7 | Many heads, and position | [07-heads.ipynb](07-heads.ipynb) |
-| 8 | The block and the stack: the model file, `medha/model.py` | |
+| 8 | The block and the stack: the model file, `medha/model.py` | [08-model.ipynb](08-model.ipynb) |
 | 9 | Train: the loss falls and beats the counting model | |
 | 10 | The KV cache: the same tokens, with less work | |
 
@@ -409,3 +409,62 @@ The largest difference: 0.000000 without position, 0.111012 with it.
   "dog bites man ." differs from "man bites dog ." only with position.
 - The run takes about 1.4 s. The weights are untrained, so the numbers mean nothing yet; only the shapes and the
   difference matter.
+
+## The block and the stack: the GPT
+
+`medha/model.py` now holds the whole GPT, in the classic GPT-2 shape. Each part is one class, with its settings in
+one frozen dataclass, `Config`.
+
+1. **`Embedding`:** each token's vector is its token row plus its position row (step 7).
+2. **`Block`, 4 of them:** a **LayerNorm** scales each vector to a mean of 0 and a spread of 1, then
+   `SelfAttention` lets the tokens read each other, and its output is added to the vector. Then a second LayerNorm,
+   and the **MLP** works on each token alone: it widens the vector 4 times, applies GELU, and narrows it back. Its
+   output is added too. So each block only adds to the vectors, which run through the whole stack: the
+   **residual stream**.
+3. **A last LayerNorm, then the head:** a Linear that gives one logit per vocabulary token at every place. The head
+   reuses the token table, as GPT-2 does, so one table reads tokens in and scores them out.
+
+`next_logits` gives the decode loop what it needs (`medha.sampler.Model`), as the pair counts do. The model reads at
+most a window of tokens. Once the window is full, the oldest tokens drop out, and the model reads the last window
+only.
+
+`vak model` builds the untrained GPT, runs it once on the prompt, and logs the shape after each part. Then it counts
+the weights, part by part.
+
+```console
+$ uv run vak model 2>&1
+   1092ms  the end token, then "Once upon a time": 5 ids, [0, 432, 445, 259, 396]
+   1092ms  after Embedding  (1, 5, 128)
+   1093ms  after Block      (1, 5, 128)
+   1093ms  after Block      (1, 5, 128)
+   1094ms  after Block      (1, 5, 128)
+   1094ms  after Block      (1, 5, 128)
+   1094ms  after LayerNorm  (1, 5, 128)
+   1094ms  after Linear     (1, 5, 2000)
+
+The weights: 4 blocks of 4 heads, width 128, a window of 128 tokens
+  token table, also the head     256,000   2,000 x 128
+  position table                  16,384   128 x 128
+    attention in one block        66,048   128 x 384 + 384 + 128 x 128 + 128
+    MLP in one block             131,712   128 x 512 + 512 + 512 x 128 + 128
+    2 LayerNorms in one block        512   2 x (128 + 128)
+  4 blocks                       793,088   4 x 198,272
+  last LayerNorm                     256   128 + 128
+  total                        1,065,728
+
+Untrained, the likeliest token after " time" has a chance of 0.00105; an even chance is 1 / 2,000 = 0.00050.
+The loss on the prompt's 4 next tokens is 7.726; an even guess scores ln 2,000 = 7.601.
+```
+
+- **The shapes:** 5 ids go in, and each part gives back (1, 5, 128): the same shape in and out of every block, so
+  blocks stack as deep as we like. Only the head changes it, to (1, 5, 2000): one logit per vocabulary token at each
+  of the 5 places. In training, each place predicts its own next token.
+- **The weights:** about 1.07 million. Most sit in the MLPs, 527,000, then the token table, 256,000, then attention,
+  264,000. The by-hand column gives each count: a Linear from a to b holds a × b weights plus b biases, and a
+  LayerNorm holds 2 numbers per place in the vector.
+- **Untrained, it guesses evenly.** Every weight starts small, drawn with a spread of 0.02. So the logits are all
+  close to 0, and every token gets about the same chance: the loss starts near ln 2,000 = 7.601, the score of an even
+  guess. Step 9 trains it.
+- The notebook [08-model.ipynb](08-model.ipynb) builds one block by hand, x plus attention, then plus the MLP. It counts the
+  weights of a small GPT by hand, too.
+- The run takes about 1.3 s.
