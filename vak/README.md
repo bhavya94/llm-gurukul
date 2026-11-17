@@ -20,7 +20,7 @@ One pull request per step. From step 2 on, each adds one command, one notebook a
 | 4 | Count pairs: the smallest language model, and its loss on held-out stories | [04-counts.ipynb](04-counts.ipynb) |
 | 5 | Sample: temperature, top-k, top-p, and the loop that writes text | [05-sample.ipynb](05-sample.ipynb) |
 | 6 | One attention head on three tokens | [06-attention.ipynb](06-attention.ipynb) |
-| 7 | Many heads, and position | |
+| 7 | Many heads, and position | [07-heads.ipynb](07-heads.ipynb) |
 | 8 | The block and the stack: the model file, `medha/model.py` | |
 | 9 | Train: the loss falls and beats the counting model | |
 | 10 | The KV cache: the same tokens, with less work | |
@@ -362,3 +362,50 @@ The bank row keeps its weights, (0.082, 0.682, 0.236), and its out becomes (0.11
 - The notebook [06-attention.ipynb](06-attention.ipynb) runs the same three tokens and works out the bank row by
   hand.
 - The run takes about 1.4 s.
+
+## Many heads, and position
+
+One head finds one kind of match. **Many heads** look for several at once. `SelfAttention` in `medha/model.py`
+makes the queries, keys and values of every head with one Linear: a learned matrix, plus a bias. It cuts each
+vector into one slice per head, and each **head** runs the same `attention` on its own slice. Then it puts the
+heads' outputs side by side again, and one more Linear mixes them.
+
+Attention alone has no sense of order: the weights depend on the vectors, not on where the tokens sit. So the
+model adds **position**. `Embedding` holds two learned tables: one row per vocabulary token, and one row per place
+in the window. A token's vector is its token row plus its position row.
+
+`vak heads` runs an untrained layer, with random weights fixed by a seed, on real tokens. Each vector has 8
+numbers, cut into 2 heads of 4. It logs the shape at each step. Then it runs two sentences with the same tokens in
+a different order.
+
+```console
+$ uv run vak heads 2>&1
+   1175ms  "The dog saw the cat." as 6 tokens: [373, 652, 413, 263, 705, 14]
+   1175ms  token vectors plus position vectors: (1, 6, 8)
+   1175ms  q, k and v from one Linear: (1, 6, 24), cut into three of (1, 6, 8)
+   1175ms  split into 2 heads of 4 numbers: each (1, 2, 6, 4)
+   1176ms  weights, one table per head: (1, 2, 6, 6)
+   1176ms  the heads side by side again: (1, 6, 8)
+   1176ms  after the output Linear: (1, 6, 8)
+
+The output of the last token, ".", in each order:
+  without position  "The dog saw the cat."  (-0.241, -0.486, -0.195, 0.107, 0.274, 0.005, 0.024, 0.022)
+  without position  "The cat saw the dog."  (-0.241, -0.486, -0.195, 0.107, 0.274, 0.005, 0.024, 0.022)
+  with position     "The dog saw the cat."  (-0.050, -0.583, -0.409, 0.245, 0.059, -0.001, -0.243, 0.113)
+  with position     "The cat saw the dog."  (-0.161, -0.516, -0.515, 0.250, 0.129, 0.089, -0.309, 0.181)
+
+The largest difference: 0.000000 without position, 0.111012 with it.
+```
+
+- **The shapes:** (1, 6, 8) is 1 sentence, 6 tokens and 8 numbers per token. One Linear gives 24 numbers per
+  token: the query, key and value, 8 each. The view and transpose turn (1, 6, 8) into (1, 2, 6, 4): 2 heads, each
+  with 6 tokens of 4 numbers. So `attention` gives one 6 × 6 table of weights per head, in one call.
+- **The work is split, not repeated:** 2 heads of 4 numbers cost about what 1 head of 8 costs.
+- **Without position,** the last token "." gets the same output in both orders. With the causal mask it reads all
+  six tokens, and those are the same six vectors in both sentences, so its mix is the same.
+- **With position,** "dog" and "cat" sit in new places, so their vectors change, and so does the output of ".":
+  by up to 0.111. Now the model can tell who saw whom.
+- The notebook [07-heads.ipynb](07-heads.ipynb) checks both by hand: one head per slice gives the layer's output, and
+  "dog bites man ." differs from "man bites dog ." only with position.
+- The run takes about 1.4 s. The weights are untrained, so the numbers mean nothing yet; only the shapes and the
+  difference matter.

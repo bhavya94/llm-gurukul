@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from medha.model import attention
+from medha.model import Embedding, SelfAttention, attention
 
 # Three tokens, "The river bank". Each vector has two numbers, read as "water" and "money".
 QUERIES = torch.tensor([[0.0, 0.0], [0.5, 0.5], [1.5, 1.5]])
@@ -29,3 +29,28 @@ def test_no_token_reads_a_later_token():
     after = attention(QUERIES, changed_keys, changed_values).out
     assert torch.equal(after[:2], before[:2])
     assert not torch.equal(after[2], before[2])
+
+
+def test_each_head_runs_attention_on_its_own_slice():
+    torch.manual_seed(0)
+    layer = SelfAttention(width=8, heads=2)
+    x = torch.randn(1, 5, 8)  # one sentence of 5 tokens, 8 numbers each
+    q, k, v = layer.qkv(x)[0].split(8, dim=-1)
+    outputs = []
+    for head in range(2):
+        part = slice(4 * head, 4 * head + 4)  # head 0 reads numbers 0 to 3 of each vector, head 1 reads 4 to 7
+        outputs.append(attention(q[:, part], k[:, part], v[:, part]).out)
+    by_hand = layer.out(torch.cat(outputs, dim=-1))
+    assert torch.allclose(layer(x)[0], by_hand, atol=1e-6)
+
+
+def test_with_position_the_order_of_earlier_tokens_changes_the_output():
+    torch.manual_seed(0)
+    embedding = Embedding(vocab_size=1_000, context=8, width=8)
+    layer = SelfAttention(width=8, heads=2)
+    dog_saw_cat = torch.tensor([[373, 652, 413, 263, 705, 14]])  # "The dog saw the cat."
+    cat_saw_dog = torch.tensor([[373, 705, 413, 263, 652, 14]])  # "The cat saw the dog.": the last token stays "."
+    without = [layer(embedding.tokens(dog_saw_cat))[0, -1], layer(embedding.tokens(cat_saw_dog))[0, -1]]
+    with_position = [layer(embedding(dog_saw_cat))[0, -1], layer(embedding(cat_saw_dog))[0, -1]]
+    assert torch.allclose(without[0], without[1], atol=1e-6)  # attention alone sees a set
+    assert (with_position[0] - with_position[1]).abs().max() > 0.01
