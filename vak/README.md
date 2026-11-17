@@ -19,7 +19,7 @@ One pull request per step. From step 2 on, each adds one command, one notebook a
 | 3 | Tokens: characters first, then BPE pieces | [03-tokens.ipynb](03-tokens.ipynb) |
 | 4 | Count pairs: the smallest language model, and its loss on held-out stories | [04-counts.ipynb](04-counts.ipynb) |
 | 5 | Sample: temperature, top-k, top-p, and the loop that writes text | [05-sample.ipynb](05-sample.ipynb) |
-| 6 | One attention head on three tokens | |
+| 6 | One attention head on three tokens | [06-attention.ipynb](06-attention.ipynb) |
 | 7 | Many heads, and position | |
 | 8 | The block and the stack: the model file, `medha/model.py` | |
 | 9 | Train: the loss falls and beats the counting model | |
@@ -295,3 +295,70 @@ After a new line, another new line is the likeliest token, so greedy never leave
 why text generation samples instead of always taking the top token.
 
 Each run takes about 1.3 s. This is the baseline's text. The GPT in step 9 reads many tokens back, not one.
+
+## Attention: one head on three tokens
+
+The pair-counting model reads one token. A GPT reads every token before the next one, and **attention** is the
+part that does it. Each token has three vectors: a **query**, what it looks for; a **key**, what it offers; and a
+**value**, what it passes on. In the model, each comes from the token's vector times a learned matrix; step 7 adds
+those. Here `vak attention` sets them by hand for three tokens, "The river bank". Each vector has two numbers, read
+as "water" and "money". The command runs `attention` from `medha/model.py` and prints each step.
+
+```console
+$ uv run vak attention
+
+Three tokens. Each query, key and value has two numbers, read as "water" and "money".
+  token   query       key         value
+  The     (0.0, 0.0)  (0.0, 0.0)  (0.0, 0.0)
+  river   (0.5, 0.5)  (2.0, 0.0)  (1.0, 0.0)
+  bank    (1.5, 1.5)  (0.5, 0.5)  (0.5, 0.5)
+
+1. Scores: each token's query times each token's key
+               The   river    bank
+  The        0.000   0.000   0.000
+  river      0.000   1.000   0.500
+  bank       0.000   3.000   1.500
+
+2. Scaled: divided by 1.414, the square root of the head size, 2
+               The   river    bank
+  The        0.000   0.000   0.000
+  river      0.000   0.707   0.354
+  bank       0.000   2.121   1.061
+
+3. Masked: minus infinity wherever a token would read a later token
+               The   river    bank
+  The        0.000    -inf    -inf
+  river      0.000   0.707    -inf
+  bank       0.000   2.121   1.061
+
+4. Weights: softmax, row by row; each row adds up to 1
+               The   river    bank
+  The        1.000   0.000   0.000
+  river      0.330   0.670   0.000
+  bank       0.082   0.682   0.236
+
+5. Out: each token's mix of the values, by its row of weights
+  The     (0.000, 0.000)
+  river   (0.670, 0.000)
+  bank    (0.800, 0.118)
+
+Put "loan" where "river" was, with key (0.0, 2.0) and value (0.0, 1.0).
+The bank row keeps its weights, (0.082, 0.682, 0.236), and its out becomes (0.118, 0.800).
+```
+
+- **Scores:** row i, column j is token i's query times token j's key. The query of "bank", (1.5, 1.5), times the
+  key of "river", (2, 0), gives 1.5 × 2 + 1.5 × 0 = 3.
+- **Scaled:** each score is divided by the square root of the head size, here √2. Without it, longer vectors give
+  bigger scores, and softmax puts nearly all the weight on one token.
+- **Masked:** a token must not read the tokens after it. In training, every row predicts its own next token, and a
+  later token would give the answer away. The **causal mask** sets those scores to minus infinity, and softmax turns
+  minus infinity into a weight of 0. So the weights are 0 above the diagonal.
+- **Weights:** softmax, row by row. In the bank row, e to the power of 0, 2.121 and 1.061 is 1, 8.342 and 2.888.
+  Each divided by their sum, 12.230, gives 0.082, 0.682 and 0.236. The notebook does this by hand.
+- **Out:** each row of weights mixes the values. For "bank": 0.682 × (1, 0) + 0.236 × (0.5, 0.5) = (0.800, 0.118).
+  The first number, "water", is high, so "bank" now reads as a riverbank.
+- With "loan" in place of "river", "bank" keeps its weights, but its output becomes (0.118, 0.800). The token is the
+  same; its neighbours change its vector.
+- The notebook [06-attention.ipynb](06-attention.ipynb) runs the same three tokens and works out the bank row by
+  hand.
+- The run takes about 1.4 s.
