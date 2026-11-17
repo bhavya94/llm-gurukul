@@ -18,7 +18,7 @@ One pull request per step. From step 2 on, each adds one command, one notebook a
 | 2 | The stories: a slice of TinyStories, with some stories held out for testing | [02-data.ipynb](02-data.ipynb) |
 | 3 | Tokens: characters first, then BPE pieces | [03-tokens.ipynb](03-tokens.ipynb) |
 | 4 | Count pairs: the smallest language model, and its loss on held-out stories | [04-counts.ipynb](04-counts.ipynb) |
-| 5 | Sample: temperature, top-k, top-p, and the loop that writes text | |
+| 5 | Sample: temperature, top-k, top-p, and the loop that writes text | [05-sample.ipynb](05-sample.ipynb) |
 | 6 | One attention head on three tokens | |
 | 7 | Many heads, and position | |
 | 8 | The block and the stack: the model file, `medha/model.py` | |
@@ -186,3 +186,112 @@ For scale, an even guess over all 2,000 tokens scores ln 2,000 = 7.601
 - This model sees one token and nothing before it. The next step shows the text that comes out of that.
 - The run takes about 20 s, and encoding and counting the stories take about 13 s of it. It uses about 1.3 GB of
   memory at its peak.
+
+## Sampling and the decode loop
+
+A model gives one score, a **logit**, to every token, and softmax turns the scores into chances. The **sampler**
+reshapes the chances, then draws one token. It applies three settings, in this order:
+
+1. **Temperature** divides every logit. Below 1 it sharpens the chances toward the top token, and above 1 it
+   flattens them. At 0 the top token always wins: that is **greedy** decoding.
+2. **Top-k** keeps only the k likeliest tokens.
+3. **Top-p** keeps the fewest tokens whose chances add up to p.
+
+The kept chances are then rescaled to add up to 1. The **decode loop** writes text: score the next token, pick one,
+append it, and go again. It stops when it picks the end token, or when it reaches its limit of new tokens.
+`medha/sampler.py` holds both, so the GPT will use the same code.
+
+`vak write` loads the pair counts from step 4. It starts after the end token, as every training story does, then
+reads the prompt. It prints the chances of the next token under six settings. Then the loop writes, and the log
+shows each pick with its chance.
+
+```console
+$ uv run vak write --tokens 20
+   1856ms  the prompt: the end token, then "Once upon a time" as 4 tokens: [432, 445, 259, 396]
+
+The chance of each next token after " time", under each setting:
+  token                T 0     T 0.5       T 1       T 2   top-k 3 top-p 0.9
+  ","                1.000     0.911     0.556     0.054     0.727     0.617
+  " there"           0.000     0.065     0.148     0.028     0.194     0.164
+  "."                0.000     0.011     0.061     0.018     0.080     0.068
+  " to"              0.000     0.011     0.060     0.018     0.000     0.067
+  " for"             0.000     0.001     0.021     0.011     0.000     0.024
+  " and"             0.000    <0.001     0.013     0.008     0.000     0.014
+  " she"             0.000    <0.001     0.008     0.007     0.000     0.009
+  " he"              0.000    <0.001     0.007     0.006     0.000     0.008
+  all others         0.000     0.001     0.125     0.850     0.000     0.029
+   1875ms  decode loop: temperature 1, top-k off, top-p off, at most 20 new tokens, seed 0
+   1878ms  step  1: ","            chance 0.556
+   1878ms  step  2: " and"         chance 0.059
+   1879ms  step  3: " asked"       chance 0.008
+   1879ms  step  4: " Lily"        chance 0.017
+   1879ms  step  5: " sad"         chance <0.001
+   1879ms  step  6: " and"         chance 0.247
+   1879ms  step  7: " pick"        chance 0.001
+   1879ms  step  8: " flowers"     chance 0.022
+   1879ms  step  9: " and"         chance 0.161
+   1879ms  step 10: " cup"         chance <0.001
+   1879ms  step 11: " pen"         chance <0.001
+   1879ms  step 12: ";"            chance <0.001
+   1879ms  step 13: " she"         chance 0.027
+   1879ms  step 14: " was"         chance 0.117
+   1879ms  step 15: " time"        chance 0.011
+   1879ms  step 16: ","            chance 0.556
+   1879ms  step 17: " she"         chance 0.040
+   1879ms  step 18: " asked"       chance 0.021
+   1879ms  step 19: "."            chance 0.168
+   1879ms  step 20: "\n"           chance 0.152
+   1879ms  stop: 20 new tokens, the limit
+
+Once upon a time, and asked Lily sad and pick flowers and cup pen; she was time, she asked.
+```
+
+- **The table:** after " time", the comma has 0.556 at T 1. T 0.5 raises it to 0.911. T 2 drops it to 0.054, and the
+  1,992 tokens below the table gain: together they hold 0.850. Top-k 3 keeps three tokens, and top-p 0.9 keeps 13.
+- **The text is poor, as expected.** Each pick depends only on the token before it, so no sentence forms.
+- **Many picks had almost no chance:** " sad", " cup", " pen" and ";". The log shows `<0.001` for a chance above 0
+  that rounds to 0.000. These tiny chances come from the counts that add-one added: every pair gets a count of at
+  least 1. For the median token, those added counts hold about half of the next-token chance, a long tail of
+  unlikely tokens. At T 1 with no cut, the loop often draws from that tail.
+- Top-p 0.9 does not fix this here: for the median token, it keeps 1,597 of the 2,000 tokens.
+
+Top-k cuts the tail. `tail -n +14` skips the table:
+
+```console
+$ uv run vak write --top-k 5 2>/dev/null | tail -n +14
+Once upon a time, and said, "You can make the little girl named Tim was so happy.
+
+
+
+
+
+
+
+"I love. She said.
+"Look, there was a time
+```
+
+Each pick is now one of the five likeliest tokens. Neighbouring words fit, as in "the little girl named Tim was so
+happy", but still no sentence forms, and the new lines pile up.
+
+Greedy is no cure:
+
+```console
+$ uv run vak write --temperature 0 --tokens 10 2>&1 | grep -E "step|stop"
+   1076ms  step  1: ","            chance 1.000
+   1076ms  step  2: " ""           chance 1.000
+   1076ms  step  3: "I"            chance 1.000
+   1076ms  step  4: "'m"           chance 1.000
+   1076ms  step  5: " sorry"       chance 1.000
+   1076ms  step  6: "."            chance 1.000
+   1076ms  step  7: "\n"           chance 1.000
+   1076ms  step  8: "\n"           chance 1.000
+   1076ms  step  9: "\n"           chance 1.000
+   1076ms  step 10: "\n"           chance 1.000
+   1076ms  stop: 10 new tokens, the limit
+```
+
+After a new line, another new line is the likeliest token, so greedy never leaves that loop. This is one reason
+why text generation samples instead of always taking the top token.
+
+Each run takes about 1.3 s. This is the baseline's text. The GPT in step 9 reads many tokens back, not one.

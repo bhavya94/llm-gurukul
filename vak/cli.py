@@ -10,7 +10,8 @@ from pathlib import Path
 import torch
 from tokenizers import Tokenizer
 
-from medha.tokenizer import character_alphabet, character_ids, merges, train_bpe
+from medha.sampler import chances, generate
+from medha.tokenizer import END, character_alphabet, character_ids, merges, train_bpe
 from vak.counts import PairCounts
 from vak.data import SEED, encode_stories, load_split
 from vak.loss import held_out_loss
@@ -24,6 +25,42 @@ TOKENIZER_FILE = RUNS / "tokenizer.json"
 COUNTS_FILE = RUNS / "counts.pt"
 SENTENCE = "Once upon a time, there was a little girl named Lily."
 VOCAB_SIZE = 2_000
+SETTINGS = [  # (label, temperature, top_k, top_p): the columns of the table vak write prints
+    ("T 0", 0.0, None, None),
+    ("T 0.5", 0.5, None, None),
+    ("T 1", 1.0, None, None),
+    ("T 2", 2.0, None, None),
+    ("top-k 3", 1.0, 3, None),
+    ("top-p 0.9", 1.0, None, 0.9),
+]
+
+
+def _whole_number(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, not {value}")
+    return value
+
+
+def _temperature(text: str) -> float:
+    value = float(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, not {value}")
+    return value
+
+
+def _share(text: str) -> float:
+    value = float(text)
+    if not 0 < value <= 1:
+        raise argparse.ArgumentTypeError(f"must be above 0 and at most 1, not {value}")
+    return value
+
+
+def _piece(tokenizer: Tokenizer, token: int) -> str:
+    """A token's text in quotes, so a leading space shows, with a new line as \\n; the end token by its name."""
+    if token == tokenizer.token_to_id(END):
+        return END
+    return '"' + tokenizer.decode([token]).replace("\n", "\\n") + '"'
 
 
 def _aligned(pieces: list[str], ids: list[int]) -> str:
@@ -39,6 +76,13 @@ def _aligned(pieces: list[str], ids: list[int]) -> str:
         bottom += str(token).ljust(width)
     lines += [top.rstrip(), bottom.rstrip()]
     return "\n".join(lines)
+
+
+def _chance(value: float) -> str:
+    """A chance to three decimals. One above 0 that would round to 0.000 shows as <0.001, so it is not read as 0."""
+    if 0 < value < 0.0005:
+        return "<0.001"
+    return f"{value:.3f}"
 
 
 def _load_tokenizer() -> Tokenizer:
@@ -97,7 +141,7 @@ def _counts(args: argparse.Namespace) -> None:
     print(f"  token        count   chance = (count + 1) / ({seen:,} + {vocab_size:,})")
     top_ten = 0.0
     for token in torch.topk(model.counts[the], 10).indices.tolist():
-        piece = '"' + tokenizer.decode([token]) + '"'
+        piece = _piece(tokenizer, token)
         count = int(model.counts[the, token])
         chance = float(model.chances[the, token])
         top_ten += chance
@@ -119,6 +163,56 @@ def _counts(args: argparse.Namespace) -> None:
           f"{math.log(vocab_size):.3f}")
 
 
+def _write(args: argparse.Namespace) -> None:
+    tokenizer = _load_tokenizer()
+    if not COUNTS_FILE.exists():
+        raise SystemExit("vak: no runs/counts.pt yet; run `uv run vak counts` first")
+    model = PairCounts.load(COUNTS_FILE)
+    end = tokenizer.token_to_id(END)
+    prompt = tokenizer.encode(args.prompt).ids
+    ids = [end] + prompt  # every training story starts after an end token, so writing does too
+    log.info('the prompt: the end token, then "%s" as %d tokens: %s', args.prompt, len(prompt), prompt)
+
+    logits = model.next_logits(ids)
+    columns = []
+    for label, temperature, top_k, top_p in SETTINGS:
+        columns.append(chances(logits, temperature, top_k, top_p))
+    print(f"\nThe chance of each next token after {_piece(tokenizer, ids[-1])}, under each setting:")
+    header = "  " + "token".ljust(14)
+    for label, temperature, top_k, top_p in SETTINGS:
+        header += label.rjust(10)
+    print(header)
+    top = torch.topk(logits, 8).indices
+    for token in top.tolist():
+        row = "  " + _piece(tokenizer, token).ljust(14)
+        for probs in columns:
+            row += _chance(float(probs[token])).rjust(10)
+        print(row)
+    others = torch.ones(len(logits), dtype=torch.bool)
+    others[top] = False  # every token below the table
+    row = "  " + "all others".ljust(14)
+    for probs in columns:
+        row += _chance(float(probs[others].sum())).rjust(10)
+    print(row)
+
+    top_k = "off" if args.top_k is None else args.top_k
+    top_p = "off" if args.top_p is None else args.top_p
+    log.info("decode loop: temperature %g, top-k %s, top-p %s, at most %d new tokens, seed %d",
+             args.temperature, top_k, top_p, args.tokens, args.seed)
+    generator = torch.Generator().manual_seed(args.seed)
+    steps = generate(model, ids, args.tokens, end, generator, args.temperature, args.top_k, args.top_p)
+    written = []
+    for number, step in enumerate(steps, start=1):
+        log.info("step %2d: %-14s chance %s", number, _piece(tokenizer, step.token), _chance(step.chance))
+        if step.token != end:
+            written.append(step.token)
+    if steps[-1].token == end:
+        log.info("stop: the model picked the end token")
+    else:
+        log.info("stop: %d new tokens, the limit", args.tokens)
+    print(f"\n{tokenizer.decode(prompt + written)}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="vak", description="vak (speech): A small GPT learns to write text, "
                                                              "one token at a time.")
@@ -129,6 +223,15 @@ def main() -> None:
     tokens.set_defaults(run=_tokens)
     counts = commands.add_parser("counts", help="count which token follows which; its chances and held-out loss")
     counts.set_defaults(run=_counts)
+    write = commands.add_parser("write", help="the chances under each sampler setting, then the decode loop writes")
+    write.add_argument("--prompt", default="Once upon a time", help="the text to continue (default: %(default)s)")
+    write.add_argument("--tokens", type=_whole_number, default=40, help="the most new tokens (default: %(default)s)")
+    write.add_argument("--temperature", type=_temperature, default=1.0,
+                       help="0 is greedy; below 1 sharpens, above 1 flattens (default: %(default)s)")
+    write.add_argument("--top-k", type=_whole_number, help="keep only the k likeliest tokens")
+    write.add_argument("--top-p", type=_share, help="keep the fewest tokens whose chances add up to p")
+    write.add_argument("--seed", type=int, default=0, help="fixes the random draws (default: %(default)s)")
+    write.set_defaults(run=_write)
     args = parser.parse_args()
 
     # One thread for the tokenizers library: on this Mac its thread pool once deadlocked PyTorch on the GPU (MPS).
