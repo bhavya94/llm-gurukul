@@ -1,5 +1,6 @@
-"""The model file: a GPT, built one part per step. Attention comes first: the part that lets each token read the
-tokens before it."""
+"""The model file: a GPT in the classic GPT-2 shape. Attention lets each token read the tokens before it, a block
+adds a small network for each token, and the GPT stacks the blocks. Each part is one class, so a part can be
+swapped on its own."""
 
 import logging
 import math
@@ -7,8 +8,19 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Config:
+    """A GPT's settings, all in one place."""
+    vocab_size: int  # tokens in the vocabulary
+    context: int  # the most tokens the model reads at once: its window
+    width: int  # numbers in each token's vector
+    heads: int  # attention heads in each block; each reads width / heads numbers
+    layers: int  # blocks in the stack
 
 
 @dataclass(frozen=True)
@@ -73,3 +85,70 @@ class SelfAttention(nn.Module):
         mixed = steps.out.transpose(1, 2).reshape(batch, tokens, width)  # the heads side by side again
         log.debug("the heads side by side again: %s", tuple(mixed.shape))
         return self.out(mixed)
+
+
+class MLP(nn.Module):
+    """Each token on its own: widen its vector 4 times, apply GELU, and narrow it back."""
+
+    def __init__(self, width: int):
+        super().__init__()
+        self.up = nn.Linear(width, 4 * width)
+        self.down = nn.Linear(4 * width, width)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.gelu(self.up(x)))
+
+
+class Block(nn.Module):
+    """One layer of the stack. Attention lets the tokens read each other, then the MLP works on each token alone.
+    Each part reads a normalized copy of x and adds its change to x, so x itself, the residual stream, passes
+    through every block."""
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(config.width)
+        self.attention = SelfAttention(config.width, config.heads)
+        self.norm2 = nn.LayerNorm(config.width)
+        self.mlp = MLP(config.width)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attention(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class GPT(nn.Module):
+    """The whole model: the Embedding, the stack of blocks, a last LayerNorm, and the head, which gives each position
+    one logit per vocabulary token. The head reuses the token table, as in GPT-2."""
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+        self.embedding = Embedding(config.vocab_size, config.context, config.width)
+        self.blocks = nn.ModuleList()
+        for _ in range(config.layers):
+            self.blocks.append(Block(config))
+        self.norm = nn.LayerNorm(config.width)
+        self.head = nn.Linear(config.width, config.vocab_size, bias=False)
+        self.head.weight = self.embedding.tokens.weight  # one table to read tokens in and to score them out
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)  # small, so every token starts near an even chance
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        """ids: (batch, tokens). Gives logits: (batch, tokens, vocab_size), a guess at the next token at each place."""
+        x = self.embedding(ids)
+        for block in self.blocks:
+            x = block(x)
+        return self.head(self.norm(x))
+
+    def next_logits(self, ids: list[int]) -> torch.Tensor:
+        """What the decode loop needs (medha.sampler.Model). The model reads at most context ids, so once the window
+        is full, the oldest ids drop out. It runs where its weights are, and gives the logits back on the CPU, where
+        the sampler draws."""
+        window = ids[-self.config.context:]
+        with torch.no_grad():
+            logits = self(torch.tensor([window], device=self.head.weight.device))
+        return logits[0, -1].cpu()
