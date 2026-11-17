@@ -1,0 +1,25 @@
+[project]
+name = "llm-gurukul"
+version = "0.1.0"
+description = "A small language model goes to school: one model, trained by hand, learns eight abilities, from writing text to resisting attacks."
+readme = "README.md"
+authors = [{ name = "Bhavya Sharma" }]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+vak = "vak.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# One package per folder at the top of the repo: medha, the shared model, and one per ability.
+module-name = ["medha", "vak"]
+module-root = ""
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
