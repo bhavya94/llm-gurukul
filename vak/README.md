@@ -23,7 +23,7 @@ One pull request per step. From step 2 on, each adds one command, one notebook a
 | 7 | Many heads, and position | [07-heads.ipynb](07-heads.ipynb) |
 | 8 | The block and the stack: the model file, `medha/model.py` | [08-model.ipynb](08-model.ipynb) |
 | 9 | Train: the loss falls and beats the counting model | [09-train.ipynb](09-train.ipynb) |
-| 10 | The KV cache: the same tokens, with less work | |
+| 10 | The KV cache: the same tokens, with less work | [10-cache.ipynb](10-cache.ipynb) |
 
 ## Run it
 
@@ -583,3 +583,64 @@ One day, the farmer saw a big
   over many tokens. The GPT is far surer, so top-p 0.9 keeps only these 2 tokens.
 - At T 1, the loop still draws from the tail at times: " sad" had a chance of 0.001. The log shows each pick.
 - Each run takes about 1.4 s.
+
+## The KV cache: the same tokens, with less work
+
+Without a cache, each step of writing reads every token again: step n reads n tokens. But the keys and values of
+the earlier tokens never change, because no token reads a later one. The **KV cache** (`KVCache` in
+`medha/model.py`) keeps each block's keys and values.
+
+1. **Prefill:** the first step reads the whole prompt once, and saves its keys and values.
+2. **Decode:** each later step reads only the newest token. Its query meets the saved keys plus its own, and its key
+   and value join the cache. `attention` now takes fewer queries than keys: the queries are the last tokens.
+3. **A full window:** the window holds 128 tokens. Past that, each step pushes the oldest token out and moves every
+   other token one place back. Its position row changes, so every saved key and value is out of date. The cache
+   then starts again from the last window at every step: the same work as without it, and the same logits.
+
+`generate` takes the cache as one more argument and passes it to the model; the pair counts never get one. That is
+the one change to the contract between the loop and a model. `vak cache` writes with the trained GPT twice, with
+the cache off and then on, with the same seed:
+
+```console
+$ uv run vak cache 2>&1
+   1537ms  cache off: the model read [5, 6, 7, 8] tokens at the first steps, 104 at the last
+   1592ms  cache on: the model read [5, 1, 1, 1] tokens at the first steps, 1 at the last
+
+Up to 100 new tokens after "Once upon a time", at temperature 1 with seed 0, on the CPU:
+             tokens   tokens/s   tokens read    cache size
+  cache off       100        652         5,450             0 bytes
+  cache on        100      1,822           104       425,984 bytes
+The same tokens both ways: yes.
+The cache keeps 2 (a key and a value) x 4 blocks x 128 numbers x 4 bytes = 4,096 bytes per token.
+
+Once upon a time, there was a sad farmer who lived in a circle. He lived in a circle and he loved the moon very much.
+
+One day, the farmer saw a big hose. He felt sad and did not see them. He wanted to help it use the wean, but he was mangcyclehip because it had two pieces of chocolates. He was very strong of them different places.
+
+The farmer picked up
+```
+
+- **The same tokens both ways,** as the test also checks, at every step and past a full window.
+- **Less work:** without the cache, the model read 5,450 tokens to write 100: 5, then 6, then 7, up to 104. With the
+  cache, it read 104: the prompt once, then 1 per step.
+- **About 2.8 times faster** here: 1,822 tokens per second against 652, on the CPU. The timings move by about 10%
+  between runs. The saving is smaller than the tokens read suggest, because at this size each step costs a
+  fixed amount for the call itself, whatever the number of tokens.
+- **The memory bill:** a key and a value in each of 4 blocks, 128 numbers each, at 4 bytes: 4,096 bytes per token.
+  At the end, the cache held 104 tokens: 425,984 bytes. A full window of 128 tokens takes 512 KB.
+- Each run takes about 1.5 s.
+
+Past a full window, the saving shrinks:
+
+```console
+$ uv run vak cache --tokens 300 2>/dev/null | head -6
+
+Up to 300 new tokens after "Once upon a time", at temperature 1 with seed 0, on the CPU:
+             tokens   tokens/s   tokens read    cache size
+  cache off       182        535        15,670             0 bytes
+  cache on        182        893         7,552       524,288 bytes
+The same tokens both ways: yes.
+```
+
+The story ends after 182 tokens. At step 124 the window is full, so from step 125 every step reads 128 tokens
+again, with or without the cache. So the cache gives about 1.7 times the speed here, not 2.8.
