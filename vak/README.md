@@ -17,7 +17,7 @@ One pull request per step. From step 2 on, each adds one command, one notebook a
 | 1 | This structure: the `vak` command | none |
 | 2 | The stories: a slice of TinyStories, with some stories held out for testing | [02-data.ipynb](02-data.ipynb) |
 | 3 | Tokens: characters first, then BPE pieces | [03-tokens.ipynb](03-tokens.ipynb) |
-| 4 | Count pairs: the smallest language model, and its loss on held-out stories | |
+| 4 | Count pairs: the smallest language model, and its loss on held-out stories | [04-counts.ipynb](04-counts.ipynb) |
 | 5 | Sample: temperature, top-k, top-p, and the loop that writes text | |
 | 6 | One attention head on three tokens | |
 | 7 | Many heads, and position | |
@@ -128,9 +128,61 @@ The BPE ids decoded back: "Once upon a time, there was a little girl named Lily.
   pair of neighbouring symbols into a new symbol, again and again. 1,743 merges fill a vocabulary of 2,000. The
   [`tokenizers`](https://github.com/huggingface/tokenizers) library does the work, in byte-level BPE, as GPT-2 does.
 - **Ġ** marks a space at the start of a piece: ` upon`, with its space, is one token, id 445. The first merges join
-  h and e, then a space with t, a, s and w: the starts of common words such as the, a, she and was.
+  h and e, then a space with t, a, s and w. Those start common words such as the, a, she and was.
 - The same sentence takes 13 BPE ids instead of 53, 4.1 times fewer. A model reads a fixed number of ids at once, so
   with BPE more of the story fits.
 - The 13 ids decode back to the exact sentence.
 - The run takes about 8 s, and training BPE takes about 6.4 s of it. The library runs on one thread here
   (`TOKENIZERS_PARALLELISM=false`); on several threads it takes 1.7 s and learns the same merges.
+
+## Counting pairs: the baseline
+
+The smallest language model counts which token follows which in the training stories. The chance of token b after
+token a is the count of the pair (a, b) over the count of a. It reads only the last token. `vak counts` counts every
+pair in the 50,000 training stories, saves the table to `runs/counts.pt`, and scores the 2,000 held-out stories.
+
+```console
+$ uv run vak counts
+   2285ms  read 529,930 stories from train-00000-of-00004-2d5a1467fff1081b.parquet
+   2804ms  dropped 20,305 blank or repeated stories: 509,625 unique stories left
+   2821ms  seed 0 picks 50,000 stories to train on and 2,000 to hold out
+  15956ms  counted 12,560,549 pairs of neighbouring tokens in 50,000 stories: 268,373 different pairs, of 4,000,000 possible
+  15974ms  saved the counts to runs/counts.pt
+
+After " the" (392,466 times in training), the 10 likeliest next tokens:
+  token        count   chance = (count + 1) / (392,466 + 2,000)
+  " park"     14,198   0.0360
+  " little"    6,229   0.0158
+  " p"         5,905   0.0150
+  " c"         5,492   0.0139
+  " sky"       5,341   0.0135
+  " sun"       5,212   0.0132
+  " bird"      5,043   0.0128
+  " ground"    4,487   0.0114
+  " tree"      4,428   0.0112
+  " garden"    4,368   0.0111
+  the other 1,990 tokens share 0.8461
+  19296ms  4,631 of the 502,358 held-out pairs never appear in training; add-one gives each a small chance, not 0
+
+Held-out loss: 3.706 per token, 95% interval 3.695 to 3.718, over 502,358 tokens in 2,000 stories
+For scale, an even guess over all 2,000 tokens scores ln 2,000 = 7.601
+```
+
+- **The chances after " the":** " park" follows " the" 14,198 times in 392,466. **Add-one smoothing** adds 1 to
+  every count first, so the chance of " park" is (14,198 + 1) / (392,466 + 2,000) = 0.0360. The ten likeliest tokens
+  share only 15% of the chance: after " the", this model is far from sure.
+- " p" and " c" start longer words that have no piece of their own: " power" is " p" then "ower", and " cave" is
+  " c" then "ave".
+- **The loss** of one token is minus the natural log of the chance the model gave the true next token. The
+  **held-out loss** is its mean over all 502,358 tokens of the held-out stories, end tokens included. Lower is better.
+- **The baseline** scores 3.706 per token, with a 95% interval from 3.695 to 3.718. The interval comes from a
+  bootstrap over whole stories (`scipy.stats.bootstrap`), because the tokens of one story depend on each other.
+  An even guess over 2,000 tokens scores ln 2,000 = 7.601, so counting pairs halves the loss.
+- **Smoothing:** 4,631 held-out pairs, about 1%, never appear in training. Without smoothing, each would get a
+  chance of 0 and an infinite loss. Add-one is the textbook rule, and we keep it. It is not the best value here:
+  adding 0.1 instead of 1 gives 3.571. We did not switch, because a value chosen by the held-out score would tune the
+  baseline on its own test. The GPT must beat 3.706, and it should beat 3.571 too.
+- The table holds 2,000 × 2,000 counts, but only 268,373 of those pairs ever occur.
+- This model sees one token and nothing before it. The next step shows the text that comes out of that.
+- The run takes about 20 s, and encoding and counting the stories take about 13 s of it. It uses about 1.3 GB of
+  memory at its peak.
