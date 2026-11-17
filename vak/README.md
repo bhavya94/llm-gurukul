@@ -5,7 +5,7 @@ A small GPT learns to write text, one token at a time.
 A language model reads text as tokens, small pieces of text, and predicts the next token. Here we build one from
 the ground up and train it on one Mac. Every later ability starts from this model.
 
-The goal: `uv run vak write --prompt "Once upon a time"` writes short story sentences. On stories it has never
+The goal: `uv run vak write --model gpt --prompt "Once upon a time"` writes short story sentences. On stories it has never
 seen, the trained GPT must also score a lower loss than a model that only counts which token follows which.
 
 ## Steps
@@ -22,7 +22,7 @@ One pull request per step. From step 2 on, each adds one command, one notebook a
 | 6 | One attention head on three tokens | [06-attention.ipynb](06-attention.ipynb) |
 | 7 | Many heads, and position | [07-heads.ipynb](07-heads.ipynb) |
 | 8 | The block and the stack: the model file, `medha/model.py` | [08-model.ipynb](08-model.ipynb) |
-| 9 | Train: the loss falls and beats the counting model | |
+| 9 | Train: the loss falls and beats the counting model | [09-train.ipynb](09-train.ipynb) |
 | 10 | The KV cache: the same tokens, with less work | |
 
 ## Run it
@@ -468,3 +468,118 @@ The loss on the prompt's 4 next tokens is 7.726; an even guess scores ln 2,000 =
 - The notebook [08-model.ipynb](08-model.ipynb) builds one block by hand, x plus attention, then plus the MLP. It counts the
   weights of a small GPT by hand, too.
 - The run takes about 1.3 s.
+
+## Training: the GPT beats the counting model
+
+`vak train` trains the GPT from step 8 on the 50,000 training stories. Then it scores the GPT on the same 2,000
+held-out stories as the pair counts, token for token.
+
+1. **The ids:** `vak/train.py` joins the training stories into one stream of 12,560,550 ids, with a single end token
+   between two stories. The first run reads and encodes the stories once, in about 13 s, and saves the ids to
+   `runs/stories.pt`. Later runs load only the ids, so the stories' text, 1.3 GB in memory, is never loaded while
+   the model trains.
+2. **One step:** draw 64 windows of 128 ids at random places in the stream, 8,192 tokens. The targets are the same
+   windows moved one token on. The loss is the mean cross-entropy over all of them. `loss.backward()` finds the
+   gradient, and AdamW, with a learning rate of 0.001, moves every weight. There is no learning-rate schedule and no
+   dropout.
+3. **5,000 steps:** 41 million tokens, 3.3 passes over the stream. The seed, 0, fixes the start weights and the
+   windows.
+4. **Held-out:** `story_losses` scores each held-out story token by token: the same tokens that the pair counts
+   scored. A story longer than the window is read in windows that overlap by half. So each token is scored once,
+   and each token past the first window has at least 64 tokens before it.
+5. **The comparison:** both models go through `held_out_loss`. `paired_difference` takes the GPT's loss minus the
+   pair counts' loss on each story, and its bootstrap draws the same stories for both.
+
+**Measured before fixing the size.** On this Mac, the GPT of step 8 (about a million weights) trains at:
+
+| Device and window | Tokens per second |
+|---|---|
+| CPU, window 128 | about 30,000 |
+| GPU (MPS), window 128 | about 80,000 |
+| GPU (MPS), window 256 | about 64,000 |
+
+On the GPU, the windows of 128 and 256 also trained for about equal time, 4.4 minutes each. On 1,000 training
+stories set aside for this test, not the 2,000 held-out stories, 128 scored 2.351 and 256 scored 2.506. So the GPT
+trains on the GPU, with a window of 128. Writing goes the other way: one token at a time, the CPU writes about 600
+tokens per second and the GPU about 140, because each small step costs the GPU a fixed delay. So scoring and
+writing run on the CPU.
+
+```console
+$ uv run vak train 2>&1
+   2146ms  training 1,065,728 weights on mps: 5,000 steps of 64 windows of 128 tokens, 40,960,000 tokens, 3.3 times the 12,560,550 in the stream
+   4437ms  step     0: loss 7.627, the mean of the last 1 batches; 1 s
+   4663ms    Once upon a time games face upon fall sadfter� balloon swam cup penady give pieceThenasaughty� neighitchen stars� rest reach Sallyoo bott kid acc else
+  16664ms  step   100: loss 5.322, the mean of the last 100 batches; 13 s
+  16946ms    Once upon a time too face back to sad and outside, the cup pen and she was time, she were worce of his friends. She knew a kid, and
+ 117861ms  step  1000: loss 3.278, the mean of the last 900 batches; 114 s
+ 118092ms    Once upon a time, there was a sad big duck. The cup was very cool, so he had worked.   He worked hard the mole kid, and
+ 572709ms  step  5000: loss 2.360, the mean of the last 4000 batches; 569 s
+ 572956ms    Once upon a time, there was a sad farmer who lived in a circle. He lived in a circle and he loved the moon very much.
+ 572960ms  trained in 571 s: 71,757 tokens/s
+ 573033ms  saved the GPT to runs/gpt.pt; scoring the held-out stories on the cpu
+
+Held-out loss per token, over 502,358 tokens in 2,000 stories, with 95% intervals:
+  counting pairs        3.706   3.695 to 3.718
+  the GPT               2.134   2.117 to 2.150
+  the GPT minus pairs  -1.573   -1.582 to -1.564, drawing the same stories
+
+Three stories from the GPT, at temperature 1:
+
+Once upon a time, there was a sad farmer who lived in a circle. He lived in a circle and he loved the moon very much.
+
+One day, the farmer saw a big hose. He felt sad and did not see them. He wanted to help it use the wean, but he was mangcyclehip because it had two pieces of chocolates. He was very strong of them different places.
+
+The farmer picked up
+
+Once upon a time, there was a little boy named Timmy. Timmy made his superhero and he loved to make music. One day, Timmy noticed that he had an about dinosaur friend and school heavier. He went to his dad and said, "Look, there is an igloo! It's perfect dancing!" His dad tried to admire the planes, but he was too long. Timmy felt very sad that he could not teach any we
+
+Once upon a time, there was a little girl named Lily. She loved to play on the mountain wet stars. One day, she saw a little girl named Sue and she ran to play with her toys.
+
+Lily saw the mountains and were scared. She ran over to the table, and started to cry. Sue started splashing and the mountains getting grey. She felt bad and ran over. But when she got there, she was lost and couldn't find the mountain
+```
+
+- **The loss falls** from 7.627, an even guess over 2,000 tokens, to 5.322 after 100 steps, 3.278 after 1,000 and
+  2.360 at the end. Each is the mean over the batches since the last line.
+- **The samples** use the same seed at every step. At step 0 they are random pieces. At step 100, words appear. At
+  1,000, sentences start to form.
+- **The GPT beats the baseline:** 2.134 per token against 3.706, and the two intervals are far apart. The paired
+  difference is -1.573, with a 95% interval from -1.582 to -1.564. The GPT is also far below 3.571, the pair
+  counts' score with add-0.1 smoothing.
+- **The text reads as short stories,** with names, speech and paragraphs. But it is not good. The meaning drifts:
+  "a sad farmer who lived in a circle". Some words are made up: "mangcyclehip". This is what a million weights
+  learn in 10 minutes.
+- The run took 594 s, about 10 minutes: 571 s of training on the GPU, at 71,757 tokens per second, then about 20 s
+  to score and write. Peak memory was 1.29 GB. The training numbers come from the GPU; the scores and the samples
+  come from the CPU.
+- **Repeats:** training on the GPU does not repeat to the last digit. Two more runs, each in a fresh clone, ended
+  with weights up to 0.06 apart from this run's. Both gave the same held-out scores, and one logged the same loss
+  at every step above. But a few chances moved by up to 0.002, and in one run the third sample took another turn after
+  "she saw a little girl named Sue". A first run in a fresh clone also logs four more lines at the top: it reads
+  the stories, drops the repeats, splits them, and saves the ids.
+
+`vak write --model gpt` writes with the trained GPT, through the same sampler and decode loop as the pair counts:
+
+```console
+$ uv run vak write --model gpt 2>/dev/null
+
+The chance of each next token after " time", under each setting:
+  token                T 0     T 0.5       T 1       T 2   top-k 3 top-p 0.9
+  ","                1.000     0.983     0.881     0.476     0.883     0.884
+  " there"           0.000     0.017     0.116     0.172     0.116     0.116
+  " in"              0.000    <0.001     0.001     0.013     0.001     0.000
+  " a"               0.000    <0.001    <0.001     0.010     0.000     0.000
+  " upon"            0.000    <0.001    <0.001     0.007     0.000     0.000
+  " time"            0.000    <0.001    <0.001     0.007     0.000     0.000
+  " the"             0.000    <0.001    <0.001     0.006     0.000     0.000
+  " with"            0.000    <0.001    <0.001     0.005     0.000     0.000
+  all others         0.000    <0.001     0.001     0.302     0.000     0.000
+
+Once upon a time, there was a sad farmer who lived in a circle. He lived in a circle and he loved the moon very much.
+
+One day, the farmer saw a big
+```
+
+- After " time", the comma has 0.881 and " there" 0.116. The pair counts gave the comma 0.556, and spread the rest
+  over many tokens. The GPT is far surer, so top-p 0.9 keeps only these 2 tokens.
+- At T 1, the loop still draws from the tail at times: " sad" had a chance of 0.001. The log shows each pick.
+- Each run takes about 1.4 s.
