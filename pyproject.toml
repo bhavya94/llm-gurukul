@@ -8,6 +8,7 @@ requires-python = ">=3.12"
 dependencies = [
     "huggingface-hub>=2.4.0",
     "pyarrow>=26.0.1",
+    "tokenizers>=0.23.3",
 ]
 
 [project.scripts]
