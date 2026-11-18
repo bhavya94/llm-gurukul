@@ -8,7 +8,9 @@ import torch
 
 
 class Model(Protocol):
-    """What the loop needs from a model: one score, a logit, per vocabulary token, for the token after ids."""
+    """What the loop needs from a model: one score, a logit, per vocabulary token, for the token after ids. A model
+    with a KV cache, such as medha.model.GPT, also takes the cache: next_logits(ids, cache). The loop passes it only
+    when it is given one."""
 
     def next_logits(self, ids: list[int]) -> torch.Tensor: ...
 
@@ -49,13 +51,19 @@ def pick(probs: torch.Tensor, generator: torch.Generator) -> int:
 
 
 def generate(model: Model, ids: list[int], max_new_tokens: int, end: int, generator: torch.Generator,
-             temperature: float = 1.0, top_k: int | None = None, top_p: float | None = None) -> list[Step]:
+             temperature: float = 1.0, top_k: int | None = None, top_p: float | None = None,
+             cache: object | None = None) -> list[Step]:
     """The decode loop: score the next token, pick one, append it, and go again. It stops at the end token or after
-    max_new_tokens, whichever comes first. Each step records the token and its chance."""
+    max_new_tokens, whichever comes first. Each step records the token and its chance. With an empty cache from the
+    model, such as medha.model.KVCache, the model reads only the new token at each step."""
     ids = list(ids)
     steps = []
     for _ in range(max_new_tokens):
-        probs = chances(model.next_logits(ids), temperature, top_k, top_p)
+        if cache is None:
+            logits = model.next_logits(ids)
+        else:
+            logits = model.next_logits(ids, cache)
+        probs = chances(logits, temperature, top_k, top_p)
         token = pick(probs, generator)
         steps.append(Step(token, float(probs[token])))
         if token == end:

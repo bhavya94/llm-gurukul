@@ -35,11 +35,13 @@ class AttentionSteps:
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> AttentionSteps:
     """One head of causal attention. q, k and v hold one row per token. Any axes before those two, such as a batch
-    or a head, are carried along."""
+    or a head, are carried along. With a KV cache, q holds only the newest tokens, so it can have fewer rows than k:
+    the queries are then the last tokens."""
     scores = q @ k.transpose(-2, -1)
     scaled = scores / math.sqrt(q.shape[-1])  # without it, bigger heads give bigger scores and a peakier softmax
-    tokens = q.shape[-2]
-    later = torch.ones(tokens, tokens, dtype=torch.bool, device=q.device).triu(diagonal=1)  # True where j > i
+    queries, keys = q.shape[-2], k.shape[-2]
+    # Query i sits at place keys - queries + i, so it may read every key up to that place. True marks a later key.
+    later = torch.ones(queries, keys, dtype=torch.bool, device=q.device).triu(diagonal=keys - queries + 1)
     masked = scaled.masked_fill(later, float("-inf"))  # softmax turns minus infinity into a weight of 0
     weights = torch.softmax(masked, dim=-1)
     out = weights @ v
@@ -55,8 +57,9 @@ class Embedding(nn.Module):
         self.tokens = nn.Embedding(vocab_size, width)  # one learned row per vocabulary token
         self.positions = nn.Embedding(context, width)  # one learned row per place in the window
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        places = torch.arange(ids.shape[-1], device=ids.device)  # 0, 1, 2, ...
+    def forward(self, ids: torch.Tensor, start: int = 0) -> torch.Tensor:
+        """start: the place of the first id; with a KV cache, the number of tokens already read."""
+        places = torch.arange(start, start + ids.shape[-1], device=ids.device)  # start, start + 1, ...
         return self.tokens(ids) + self.positions(places)
 
 
@@ -70,7 +73,7 @@ class SelfAttention(nn.Module):
         self.qkv = nn.Linear(width, 3 * width)
         self.out = nn.Linear(width, width)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: "KVCache | None" = None, layer: int = 0) -> torch.Tensor:
         batch, tokens, width = x.shape
         size = width // self.heads
         qkv = self.qkv(x)
@@ -80,6 +83,8 @@ class SelfAttention(nn.Module):
         k = k.view(batch, tokens, self.heads, size).transpose(1, 2)
         v = v.view(batch, tokens, self.heads, size).transpose(1, 2)
         log.debug("split into %d heads of %d numbers: each %s", self.heads, size, tuple(q.shape))
+        if cache is not None:
+            k, v = cache.add(layer, k, v)  # the keys and values of every token so far, the new ones last
         steps = attention(q, k, v)
         log.debug("weights, one table per head: %s", tuple(steps.weights.shape))
         mixed = steps.out.transpose(1, 2).reshape(batch, tokens, width)  # the heads side by side again
@@ -111,8 +116,8 @@ class Block(nn.Module):
         self.norm2 = nn.LayerNorm(config.width)
         self.mlp = MLP(config.width)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attention(self.norm1(x))
+    def forward(self, x: torch.Tensor, cache: "KVCache | None" = None, layer: int = 0) -> torch.Tensor:
+        x = x + self.attention(self.norm1(x), cache, layer)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -137,18 +142,64 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        """ids: (batch, tokens). Gives logits: (batch, tokens, vocab_size), a guess at the next token at each place."""
-        x = self.embedding(ids)
-        for block in self.blocks:
-            x = block(x)
+    def forward(self, ids: torch.Tensor, cache: "KVCache | None" = None) -> torch.Tensor:
+        """ids: (batch, tokens). Gives logits: (batch, tokens, vocab_size), a guess at the next token at each place.
+        With a cache, ids are only the new tokens, and they sit after the cache's tokens."""
+        start = 0 if cache is None else cache.length
+        x = self.embedding(ids, start)
+        for layer, block in enumerate(self.blocks):
+            x = block(x, cache, layer)
         return self.head(self.norm(x))
 
-    def next_logits(self, ids: list[int]) -> torch.Tensor:
+    def next_logits(self, ids: list[int], cache: "KVCache | None" = None) -> torch.Tensor:
         """What the decode loop needs (medha.sampler.Model). The model reads at most context ids, so once the window
         is full, the oldest ids drop out. It runs where its weights are, and gives the logits back on the CPU, where
-        the sampler draws."""
+        the sampler draws.
+
+        Without a cache, it reads the whole window again at every step. With a cache, it reads only the ids the cache
+        has not seen: the whole prompt at the first step (prefill), then one id per step (decode). Once the window is
+        full, each step moves every token one place back, so every saved key and value is out of date. The cache then
+        starts again from the last window: the same work as without it, and the same logits."""
         window = ids[-self.config.context:]
+        if cache is not None and len(ids) > self.config.context:
+            cache.clear()
+        new = window if cache is None else window[cache.length:]
         with torch.no_grad():
-            logits = self(torch.tensor([window], device=self.head.weight.device))
+            logits = self(torch.tensor([new], device=self.head.weight.device), cache)
         return logits[0, -1].cpu()
+
+
+class KVCache:
+    """Each block's keys and values for every token read so far, so the next step reads only the new tokens. A cache
+    belongs to one text: the ids given to next_logits must start with the ones it has read."""
+
+    def __init__(self, layers: int):
+        self.keys: list[torch.Tensor | None] = [None] * layers
+        self.values: list[torch.Tensor | None] = [None] * layers
+
+    @property
+    def length(self) -> int:
+        """How many tokens the cache holds."""
+        if self.keys[0] is None:
+            return 0
+        return self.keys[0].shape[-2]
+
+    def add(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append one block's new keys and values, and give back all of that block's keys and values."""
+        if self.keys[layer] is not None:
+            k = torch.cat([self.keys[layer], k], dim=-2)
+            v = torch.cat([self.values[layer], v], dim=-2)
+        self.keys[layer] = k
+        self.values[layer] = v
+        return k, v
+
+    def clear(self) -> None:
+        self.keys = [None] * len(self.keys)
+        self.values = [None] * len(self.values)
+
+    def size_in_bytes(self) -> int:
+        total = 0
+        for saved in self.keys + self.values:
+            if saved is not None:
+                total += saved.numel() * saved.element_size()
+        return total

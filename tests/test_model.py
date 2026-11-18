@@ -4,7 +4,8 @@ import pytest
 import torch
 from torch import nn
 
-from medha.model import GPT, Block, Config, Embedding, SelfAttention, attention
+from medha.model import GPT, Block, Config, Embedding, KVCache, SelfAttention, attention
+from medha.sampler import generate
 
 # Three tokens, "The river bank". Each vector has two numbers, read as "water" and "money".
 QUERIES = torch.tensor([[0.0, 0.0], [0.5, 0.5], [1.5, 1.5]])
@@ -107,3 +108,29 @@ def test_a_full_window_drops_the_oldest_tokens():
     model = GPT(SMALL)
     ids = [0, 1, 2, 3, 4, 1, 5, 0, 1, 2, 3]  # 11 ids, more than the window of 8
     assert torch.equal(model.next_logits(ids), model.next_logits(ids[-8:]))
+
+
+def test_one_new_query_reads_every_key_before_it():
+    torch.manual_seed(0)
+    q, k, v = torch.randn(5, 4), torch.randn(5, 4), torch.randn(5, 4)
+    last = attention(q[-1:], k, v)  # a decode step: only the newest token asks, and it may read all five
+    assert torch.allclose(last.out[0], attention(q, k, v).out[-1], atol=1e-6)
+
+
+def test_with_the_cache_the_model_writes_the_same_tokens():
+    torch.manual_seed(0)
+    model = GPT(SMALL)  # a window of 8, so 20 new tokens fill it, then slide it
+    cache = KVCache(SMALL.layers)
+    runs = []
+    for use in (None, cache):
+        steps = generate(model, [0, 1, 2], max_new_tokens=20, end=7, generator=torch.Generator().manual_seed(0),
+                         cache=use)  # 7 is no token here, so the loop runs all 20 steps
+        runs.append([step.token for step in steps])
+    assert runs[0] == runs[1]
+    assert len(runs[0]) == 20
+    assert cache.length == 8  # the cache was used: it holds the last full window
+    ids = [0, 1, 2] + runs[0]
+    fresh = KVCache(SMALL.layers)
+    for end in range(3, len(ids)):  # the prefill, each decode step, and each step past the full window
+        assert torch.allclose(model.next_logits(ids[:end], fresh), model.next_logits(ids[:end]), atol=1e-6)
+        assert fresh.length == min(end, 8)  # it holds every token read, so the next step reads one new token
