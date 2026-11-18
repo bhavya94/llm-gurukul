@@ -34,3 +34,28 @@ def held_out_loss(losses_per_story: list[list[float]], seed: int) -> HeldOutLoss
                              rng=seed)
     interval = result.confidence_interval
     return HeldOutLoss(mean, float(interval.low), float(interval.high), sum(counts), len(totals))
+
+
+def _difference(ours: np.ndarray, theirs: np.ndarray, counts: np.ndarray) -> float:
+    """Our loss minus theirs, per token, for one draw of stories."""
+    return (np.sum(ours) - np.sum(theirs)) / np.sum(counts)
+
+
+def paired_difference(ours: list[list[float]], theirs: list[list[float]], seed: int) -> HeldOutLoss:
+    """Our loss minus theirs, per token, on the same tokens of the same stories. The bootstrap draws the same stories
+    for both models, so a story that is hard for both counts against both, and the interval shows only how sure the
+    gap is."""
+    ours_totals = []
+    theirs_totals = []
+    counts = []
+    for our_losses, their_losses in zip(ours, theirs, strict=True):
+        if len(our_losses) != len(their_losses):
+            raise ValueError("the two models must score the same tokens of each story")
+        ours_totals.append(sum(our_losses))
+        theirs_totals.append(sum(their_losses))
+        counts.append(len(our_losses))
+    mean = (sum(ours_totals) - sum(theirs_totals)) / sum(counts)
+    result = stats.bootstrap((ours_totals, theirs_totals, counts), _difference, paired=True, vectorized=False,
+                             confidence_level=0.95, rng=seed)
+    interval = result.confidence_interval
+    return HeldOutLoss(mean, float(interval.low), float(interval.high), sum(counts), len(counts))

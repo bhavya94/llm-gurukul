@@ -5,6 +5,8 @@ import logging
 import math
 import os
 import sys
+import time
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -16,7 +18,8 @@ from medha.sampler import chances, generate
 from medha.tokenizer import END, character_alphabet, character_ids, merges, train_bpe
 from vak.counts import PairCounts
 from vak.data import SEED, encode_stories, load_split
-from vak.loss import held_out_loss
+from vak.loss import held_out_loss, paired_difference
+from vak.train import BATCH, join, sample, story_losses, train
 
 log = logging.getLogger(__name__)
 
@@ -25,9 +28,16 @@ LOG_FORMAT = "%(relativeCreated)7.0fms  %(message)s"
 RUNS = Path(__file__).resolve().parent.parent / "runs"  # git-ignored: the files the commands make
 TOKENIZER_FILE = RUNS / "tokenizer.json"
 COUNTS_FILE = RUNS / "counts.pt"
+STORIES_FILE = RUNS / "stories.pt"  # the training stream and the held-out stories, as ids
+GPT_FILE = RUNS / "gpt.pt"
 SENTENCE = "Once upon a time, there was a little girl named Lily."
 VOCAB_SIZE = 2_000
 GPT_CONFIG = Config(vocab_size=VOCAB_SIZE, context=128, width=128, heads=4, layers=4)
+TRAIN_STEPS = 5_000
+# Measured on this Mac (M1, 8 GB): training runs about 2.4 times faster on the GPU (MPS) than on the CPU, but
+# writing one token at a time runs faster on the CPU, because each small step costs the GPU a fixed delay.
+TRAIN_DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+WRITE_DEVICE = "cpu"
 SETTINGS = [  # (label, temperature, top_k, top_p): the columns of the table vak write prints
     ("T 0", 0.0, None, None),
     ("T 0.5", 0.5, None, None),
@@ -113,6 +123,28 @@ def _matrix(title: str, matrix: torch.Tensor) -> None:
         for number in row:
             line += f"{number:8.3f}"
         print(line)
+
+
+def _load_gpt() -> GPT:
+    if not GPT_FILE.exists():
+        raise SystemExit("vak: no runs/gpt.pt yet; run `uv run vak train` first")
+    saved = torch.load(GPT_FILE)
+    model = GPT(Config(**saved["config"]))
+    model.load_state_dict(saved["weights"])
+    return model.to(WRITE_DEVICE)
+
+
+def _encoded(tokenizer: Tokenizer) -> tuple[torch.Tensor, list[list[int]]]:
+    """The training stories as one stream of ids, and the held-out stories as ids, each framed by end tokens as the
+    baseline scored them. Reading and encoding the stories takes about 15 s and 1.3 GB, so it runs once; later runs
+    load runs/stories.pt, and the stories' text never stays in memory while the model trains."""
+    if not STORIES_FILE.exists():
+        parts = load_split()
+        stream = join(encode_stories(tokenizer, parts.train))
+        torch.save({"train": stream, "held_out": encode_stories(tokenizer, parts.held_out)}, STORIES_FILE)
+        log.info("saved the ids to runs/%s", STORIES_FILE.name)
+    saved = torch.load(STORIES_FILE)
+    return saved["train"], saved["held_out"]
 
 
 def _load_tokenizer() -> Tokenizer:
@@ -295,11 +327,51 @@ def _model(args: argparse.Namespace) -> None:
           f"ln {vocab:,} = {math.log(vocab):.3f}.")
 
 
-def _write(args: argparse.Namespace) -> None:
+def _train(args: argparse.Namespace) -> None:
     tokenizer = _load_tokenizer()
     if not COUNTS_FILE.exists():
         raise SystemExit("vak: no runs/counts.pt yet; run `uv run vak counts` first")
-    model = PairCounts.load(COUNTS_FILE)
+    stream, held_out = _encoded(tokenizer)
+    torch.manual_seed(SEED)
+    model = GPT(GPT_CONFIG).to(TRAIN_DEVICE)
+    tokens = TRAIN_STEPS * BATCH * GPT_CONFIG.context
+    log.info("training %s weights on %s: %s steps of %d windows of %d tokens, %s tokens, %.1f times the %s in the "
+             "stream", f"{_count(model):,}", TRAIN_DEVICE, f"{TRAIN_STEPS:,}", BATCH, GPT_CONFIG.context,
+             f"{tokens:,}", tokens / len(stream), f"{len(stream):,}")
+    started = time.time()
+    train(model, stream, TRAIN_STEPS, tokenizer, SEED)
+    seconds = time.time() - started
+    log.info("trained in %.0f s: %s tokens/s", seconds, f"{tokens / seconds:,.0f}")
+    model.to(WRITE_DEVICE)
+    torch.save({"config": asdict(GPT_CONFIG), "weights": model.state_dict()}, GPT_FILE)
+    log.info("saved the GPT to runs/%s; scoring the held-out stories on the %s", GPT_FILE.name, WRITE_DEVICE)
+
+    counts = PairCounts.load(COUNTS_FILE)
+    gpt_losses = []
+    count_losses = []
+    for ids in held_out:
+        gpt_losses.append(story_losses(model, ids))
+        count_losses.append(counts.losses(ids))
+    gpt = held_out_loss(gpt_losses, SEED)
+    baseline = held_out_loss(count_losses, SEED)
+    gap = paired_difference(gpt_losses, count_losses, SEED)
+    print(f"\nHeld-out loss per token, over {gpt.tokens:,} tokens in {gpt.stories:,} stories, with 95% intervals:")
+    print(f"  counting pairs        {baseline.mean:.3f}   {baseline.low:.3f} to {baseline.high:.3f}")
+    print(f"  the GPT               {gpt.mean:.3f}   {gpt.low:.3f} to {gpt.high:.3f}")
+    print(f"  the GPT minus pairs  {gap.mean:+.3f}   {gap.low:+.3f} to {gap.high:+.3f}, drawing the same stories")
+    print("\nThree stories from the GPT, at temperature 1:")
+    for seed in range(3):
+        print(f"\n{sample(model, tokenizer, 100, seed)}")
+
+
+def _write(args: argparse.Namespace) -> None:
+    tokenizer = _load_tokenizer()
+    if args.model == "gpt":
+        model = _load_gpt()
+    elif COUNTS_FILE.exists():
+        model = PairCounts.load(COUNTS_FILE)
+    else:
+        raise SystemExit("vak: no runs/counts.pt yet; run `uv run vak counts` first")
     end = tokenizer.token_to_id(END)
     prompt = tokenizer.encode(args.prompt).ids
     ids = [end] + prompt  # every training story starts after an end token, so writing does too
@@ -361,7 +433,11 @@ def main() -> None:
     heads.set_defaults(run=_heads)
     model = commands.add_parser("model", help="shapes through the whole GPT, and its weights part by part")
     model.set_defaults(run=_model)
+    training = commands.add_parser("train", help="train the GPT, then score it against the pair counts")
+    training.set_defaults(run=_train)
     write = commands.add_parser("write", help="the chances under each sampler setting, then the decode loop writes")
+    write.add_argument("--model", choices=["counts", "gpt"], default="counts",
+                       help="the pair counts from step 4, or the GPT from step 9 (default: %(default)s)")
     write.add_argument("--prompt", default="Once upon a time", help="the text to continue (default: %(default)s)")
     write.add_argument("--tokens", type=_whole_number, default=40, help="the most new tokens (default: %(default)s)")
     write.add_argument("--temperature", type=_temperature, default=1.0,
