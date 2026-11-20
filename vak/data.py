@@ -8,6 +8,9 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 from huggingface_hub import hf_hub_download
+from tokenizers import Tokenizer
+
+from medha.tokenizer import END
 
 log = logging.getLogger(__name__)
 
@@ -69,3 +72,13 @@ def load_split() -> Split:
     log.info("seed %d picks %s stories to train on and %s to hold out", SEED,
              f"{len(parts.train):,}", f"{len(parts.held_out):,}")
     return parts
+
+
+def encode_stories(tokenizer: Tokenizer, stories: list[str]) -> list[list[int]]:
+    """Each story as ids, with the end token before and after it. So a model also learns how a story starts, from
+    the token after an end, and when it stops, at the next end."""
+    end = tokenizer.token_to_id(END)
+    encoded = []
+    for encoding in tokenizer.encode_batch(stories):
+        encoded.append([end] + encoding.ids + [end])
+    return encoded
