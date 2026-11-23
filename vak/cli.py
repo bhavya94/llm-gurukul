@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 from tokenizers import Tokenizer
 
-from medha.model import attention
+from medha.model import Embedding, SelfAttention, attention
 from medha.sampler import chances, generate
 from medha.tokenizer import END, character_alphabet, character_ids, merges, train_bpe
 from vak.counts import PairCounts
@@ -40,6 +40,7 @@ TOY_QUERIES = [[0.0, 0.0], [0.5, 0.5], [1.5, 1.5]]
 TOY_KEYS = [[0.0, 0.0], [2.0, 0.0], [0.5, 0.5]]
 TOY_VALUES = [[0.0, 0.0], [1.0, 0.0], [0.5, 0.5]]
 LOAN_KEY, LOAN_VALUE = [0.0, 2.0], [0.0, 1.0]  # "loan", to put where "river" was
+ORDERS = ["The dog saw the cat.", "The cat saw the dog."]  # the same tokens; dog and cat swap places
 
 
 def _whole_number(text: str) -> int:
@@ -211,6 +212,35 @@ def _attention(args: argparse.Namespace) -> None:
     print(f"The bank row keeps its weights, {_pair(loan.weights[2])}, and its out becomes {_pair(loan.out[2])}.")
 
 
+def _heads(args: argparse.Namespace) -> None:
+    tokenizer = _load_tokenizer()
+    torch.manual_seed(0)  # an untrained layer: random weights, fixed by the seed
+    embedding = Embedding(tokenizer.get_vocab_size(), context=16, width=8)
+    layer = SelfAttention(width=8, heads=2)
+    orders = []
+    for sentence in ORDERS:
+        orders.append(torch.tensor([tokenizer.encode(sentence).ids]))
+    log.info('"%s" as %d tokens: %s', ORDERS[0], orders[0].shape[1], orders[0][0].tolist())
+    logging.getLogger("medha.model").setLevel(logging.DEBUG)  # the layer logs each shape
+    with torch.no_grad():
+        x = embedding(orders[0])
+        log.info("token vectors plus position vectors: %s", tuple(x.shape))
+        out = layer(x)
+        log.info("after the output Linear: %s", tuple(out.shape))
+    logging.getLogger("medha.model").setLevel(logging.INFO)
+
+    print('\nThe output of the last token, ".", in each order:')
+    gaps = []
+    for label, vectors in [("without position", embedding.tokens), ("with position", embedding)]:
+        last = []
+        for sentence, ids in zip(ORDERS, orders):
+            with torch.no_grad():
+                last.append(layer(vectors(ids))[0, -1])
+            print(f'  {label:17} "{sentence}"  {_pair(last[-1])}')
+        gaps.append(float((last[0] - last[1]).abs().max()))
+    print(f"\nThe largest difference: {gaps[0]:.6f} without position, {gaps[1]:.6f} with it.")
+
+
 def _write(args: argparse.Namespace) -> None:
     tokenizer = _load_tokenizer()
     if not COUNTS_FILE.exists():
@@ -273,6 +303,8 @@ def main() -> None:
     counts.set_defaults(run=_counts)
     attend = commands.add_parser("attention", help="one attention head on three tokens, one step at a time")
     attend.set_defaults(run=_attention)
+    heads = commands.add_parser("heads", help="shapes through many heads; with position, order changes the output")
+    heads.set_defaults(run=_heads)
     write = commands.add_parser("write", help="the chances under each sampler setting, then the decode loop writes")
     write.add_argument("--prompt", default="Once upon a time", help="the text to continue (default: %(default)s)")
     write.add_argument("--tokens", type=_whole_number, default=40, help="the most new tokens (default: %(default)s)")

@@ -1,10 +1,14 @@
 """The model file: a GPT, built one part per step. Attention comes first: the part that lets each token read the
 tokens before it."""
 
+import logging
 import math
 from dataclasses import dataclass
 
 import torch
+from torch import nn
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -28,3 +32,44 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> AttentionSte
     weights = torch.softmax(masked, dim=-1)
     out = weights @ v
     return AttentionSteps(scores, scaled, masked, weights, out)
+
+
+class Embedding(nn.Module):
+    """Each token's vector: its row of the token table, plus the row of the position table for the place it sits in.
+    Attention alone treats the tokens before a token as a set; the position rows tell it their order."""
+
+    def __init__(self, vocab_size: int, context: int, width: int):
+        super().__init__()
+        self.tokens = nn.Embedding(vocab_size, width)  # one learned row per vocabulary token
+        self.positions = nn.Embedding(context, width)  # one learned row per place in the window
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        places = torch.arange(ids.shape[-1], device=ids.device)  # 0, 1, 2, ...
+        return self.tokens(ids) + self.positions(places)
+
+
+class SelfAttention(nn.Module):
+    """Many heads side by side. One Linear makes the queries, keys and values of every head at once. Each head runs
+    attention on its own slice of width / heads numbers, and a last Linear mixes the heads' outputs."""
+
+    def __init__(self, width: int, heads: int):
+        super().__init__()
+        self.heads = heads
+        self.qkv = nn.Linear(width, 3 * width)
+        self.out = nn.Linear(width, width)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, tokens, width = x.shape
+        size = width // self.heads
+        qkv = self.qkv(x)
+        q, k, v = qkv.split(width, dim=-1)
+        log.debug("q, k and v from one Linear: %s, cut into three of %s", tuple(qkv.shape), tuple(q.shape))
+        q = q.view(batch, tokens, self.heads, size).transpose(1, 2)  # (batch, heads, tokens, size)
+        k = k.view(batch, tokens, self.heads, size).transpose(1, 2)
+        v = v.view(batch, tokens, self.heads, size).transpose(1, 2)
+        log.debug("split into %d heads of %d numbers: each %s", self.heads, size, tuple(q.shape))
+        steps = attention(q, k, v)
+        log.debug("weights, one table per head: %s", tuple(steps.weights.shape))
+        mixed = steps.out.transpose(1, 2).reshape(batch, tokens, width)  # the heads side by side again
+        log.debug("the heads side by side again: %s", tuple(mixed.shape))
+        return self.out(mixed)
