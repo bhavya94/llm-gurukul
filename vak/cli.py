@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 from tokenizers import Tokenizer
 
+from medha.model import attention
 from medha.sampler import chances, generate
 from medha.tokenizer import END, character_alphabet, character_ids, merges, train_bpe
 from vak.counts import PairCounts
@@ -33,6 +34,12 @@ SETTINGS = [  # (label, temperature, top_k, top_p): the columns of the table vak
     ("top-k 3", 1.0, 3, None),
     ("top-p 0.9", 1.0, None, 0.9),
 ]
+# The toy for vak attention: three tokens. Each vector has two numbers, read as "water" and "money".
+TOY_TOKENS = ["The", "river", "bank"]
+TOY_QUERIES = [[0.0, 0.0], [0.5, 0.5], [1.5, 1.5]]
+TOY_KEYS = [[0.0, 0.0], [2.0, 0.0], [0.5, 0.5]]
+TOY_VALUES = [[0.0, 0.0], [1.0, 0.0], [0.5, 0.5]]
+LOAN_KEY, LOAN_VALUE = [0.0, 2.0], [0.0, 1.0]  # "loan", to put where "river" was
 
 
 def _whole_number(text: str) -> int:
@@ -83,6 +90,26 @@ def _chance(value: float) -> str:
     if 0 < value < 0.0005:
         return "<0.001"
     return f"{value:.3f}"
+
+
+def _pair(vector: list[float] | torch.Tensor, decimals: int = 3) -> str:
+    numbers = []
+    for number in vector:
+        numbers.append(f"{float(number):.{decimals}f}")
+    return "(" + ", ".join(numbers) + ")"
+
+
+def _matrix(title: str, matrix: torch.Tensor) -> None:
+    """A 3 x 3 table: one row per token that reads, one column per token it reads."""
+    header = " " * 10
+    for token in TOY_TOKENS:
+        header += token.rjust(8)
+    print(f"\n{title}\n{header}")
+    for token, row in zip(TOY_TOKENS, matrix.tolist()):
+        line = "  " + token.ljust(8)
+        for number in row:
+            line += f"{number:8.3f}"
+        print(line)
 
 
 def _load_tokenizer() -> Tokenizer:
@@ -163,6 +190,27 @@ def _counts(args: argparse.Namespace) -> None:
           f"{math.log(vocab_size):.3f}")
 
 
+def _attention(args: argparse.Namespace) -> None:
+    q, k, v = torch.tensor(TOY_QUERIES), torch.tensor(TOY_KEYS), torch.tensor(TOY_VALUES)
+    print('\nThree tokens. Each query, key and value has two numbers, read as "water" and "money".')
+    print("  token   query       key         value")
+    for token, query, key, value in zip(TOY_TOKENS, TOY_QUERIES, TOY_KEYS, TOY_VALUES):
+        print(f"  {token:8}{_pair(query, 1):12}{_pair(key, 1):12}{_pair(value, 1)}")
+    steps = attention(q, k, v)
+    _matrix("1. Scores: each token's query times each token's key", steps.scores)
+    _matrix(f"2. Scaled: divided by {math.sqrt(2):.3f}, the square root of the head size, 2", steps.scaled)
+    _matrix("3. Masked: minus infinity wherever a token would read a later token", steps.masked)
+    _matrix("4. Weights: softmax, row by row; each row adds up to 1", steps.weights)
+    print("\n5. Out: each token's mix of the values, by its row of weights")
+    for token, out in zip(TOY_TOKENS, steps.out):
+        print(f"  {token:8}{_pair(out)}")
+
+    k[1], v[1] = torch.tensor(LOAN_KEY), torch.tensor(LOAN_VALUE)
+    loan = attention(q, k, v)
+    print(f'\nPut "loan" where "river" was, with key {_pair(LOAN_KEY, 1)} and value {_pair(LOAN_VALUE, 1)}.')
+    print(f"The bank row keeps its weights, {_pair(loan.weights[2])}, and its out becomes {_pair(loan.out[2])}.")
+
+
 def _write(args: argparse.Namespace) -> None:
     tokenizer = _load_tokenizer()
     if not COUNTS_FILE.exists():
@@ -223,6 +271,8 @@ def main() -> None:
     tokens.set_defaults(run=_tokens)
     counts = commands.add_parser("counts", help="count which token follows which; its chances and held-out loss")
     counts.set_defaults(run=_counts)
+    attend = commands.add_parser("attention", help="one attention head on three tokens, one step at a time")
+    attend.set_defaults(run=_attention)
     write = commands.add_parser("write", help="the chances under each sampler setting, then the decode loop writes")
     write.add_argument("--prompt", default="Once upon a time", help="the text to continue (default: %(default)s)")
     write.add_argument("--tokens", type=_whole_number, default=40, help="the most new tokens (default: %(default)s)")
