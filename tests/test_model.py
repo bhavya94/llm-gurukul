@@ -2,8 +2,9 @@ import math
 
 import pytest
 import torch
+from torch import nn
 
-from medha.model import Embedding, SelfAttention, attention
+from medha.model import GPT, Block, Config, Embedding, SelfAttention, attention
 
 # Three tokens, "The river bank". Each vector has two numbers, read as "water" and "money".
 QUERIES = torch.tensor([[0.0, 0.0], [0.5, 0.5], [1.5, 1.5]])
@@ -54,3 +55,55 @@ def test_with_position_the_order_of_earlier_tokens_changes_the_output():
     with_position = [layer(embedding(dog_saw_cat))[0, -1], layer(embedding(cat_saw_dog))[0, -1]]
     assert torch.allclose(without[0], without[1], atol=1e-6)  # attention alone sees a set
     assert (with_position[0] - with_position[1]).abs().max() > 0.01
+
+# A small GPT: the six words of "the cat sat on the mat" and the end token, as in the notebooks.
+SMALL = Config(vocab_size=7, context=8, width=8, heads=2, layers=2)
+
+
+def test_a_block_adds_its_changes_to_the_residual_stream():
+    torch.manual_seed(0)
+    block = Block(SMALL)
+    for last in (block.attention.out, block.mlp.down):  # the last Linear of each part now gives 0
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
+    x = torch.randn(1, 5, 8)
+    assert torch.equal(block(x), x)  # both parts add 0, so x passes through unchanged
+
+
+def test_the_weight_count_matches_the_hand_count():
+    model = GPT(SMALL)
+    tables = 7 * 8 + 8 * 8  # the token table, which the head reuses, and the position table
+    attention = (8 * 24 + 24) + (8 * 8 + 8)
+    mlp = (8 * 32 + 32) + (32 * 8 + 8)
+    norms = 2 * (8 + 8)
+    total = 0
+    for weights in model.parameters():
+        total += weights.numel()
+    assert total == tables + 2 * (attention + mlp + norms) + (8 + 8)
+
+
+def test_through_the_whole_stack_no_position_reads_a_later_token():
+    torch.manual_seed(0)
+    model = GPT(SMALL)
+    story = torch.tensor([[0, 1, 2, 3, 4, 1, 5, 0]])  # <|endoftext|> the cat sat on the mat <|endoftext|>
+    changed = story.clone()
+    changed[0, 5] = 6  # a new token at place 5
+    assert torch.equal(model(changed)[0, :5], model(story)[0, :5])
+    assert not torch.allclose(model(changed)[0, 5], model(story)[0, 5])
+
+
+def test_untrained_every_token_has_about_the_same_chance():
+    torch.manual_seed(0)
+    model = GPT(Config(vocab_size=2_000, context=16, width=32, heads=2, layers=2))
+    ids = torch.randint(0, 2_000, (4, 16))
+    with torch.no_grad():
+        logits = model(ids)
+    loss = nn.functional.cross_entropy(logits[:, :-1].reshape(-1, 2_000), ids[:, 1:].reshape(-1))
+    assert float(loss) == pytest.approx(math.log(2_000), abs=0.05)
+
+
+def test_a_full_window_drops_the_oldest_tokens():
+    torch.manual_seed(0)
+    model = GPT(SMALL)
+    ids = [0, 1, 2, 3, 4, 1, 5, 0, 1, 2, 3]  # 11 ids, more than the window of 8
+    assert torch.equal(model.next_logits(ids), model.next_logits(ids[-8:]))
