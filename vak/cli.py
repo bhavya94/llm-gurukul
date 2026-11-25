@@ -13,7 +13,7 @@ import torch
 from tokenizers import Tokenizer
 from torch.nn import functional as F
 
-from medha.model import GPT, Config, Embedding, SelfAttention, attention
+from medha.model import GPT, Config, Embedding, KVCache, SelfAttention, attention
 from medha.sampler import chances, generate
 from medha.tokenizer import END, character_alphabet, character_ids, merges, train_bpe
 from vak.counts import PairCounts
@@ -364,6 +364,45 @@ def _train(args: argparse.Namespace) -> None:
         print(f"\n{sample(model, tokenizer, 100, seed)}")
 
 
+def _cache(args: argparse.Namespace) -> None:
+    tokenizer = _load_tokenizer()
+    model = _load_gpt()
+    end = tokenizer.token_to_id(END)
+    prompt = [end] + tokenizer.encode("Once upon a time").ids
+    reads = []
+
+    def note_read(part: torch.nn.Module, inputs: tuple, output: torch.Tensor) -> None:
+        reads.append(output.shape[1])  # a forward hook on the Embedding: how many tokens the model read this step
+
+    model.embedding.register_forward_hook(note_read)
+    generate(model, prompt, 3, end, torch.Generator().manual_seed(0))  # a first run, so neither timing pays start-up
+    runs = []
+    rows = []
+    for label in ("off", "on"):
+        cache = None if label == "off" else KVCache(model.config.layers)
+        reads.clear()
+        started = time.perf_counter()
+        steps = generate(model, prompt, args.tokens, end, torch.Generator().manual_seed(0), cache=cache)
+        seconds = time.perf_counter() - started
+        runs.append([step.token for step in steps])
+        size = 0 if cache is None else cache.size_in_bytes()
+        log.info("cache %s: the model read %s tokens at the first steps, %s at the last", label, reads[:4], reads[-1])
+        rows.append(f"  cache {label:3}  {len(steps):8}{len(steps) / seconds:11,.0f}{sum(reads):14,}{size:14,} bytes")
+    print(f'\nUp to {args.tokens} new tokens after "Once upon a time", at temperature 1 with seed 0, on the CPU:')
+    print("             tokens   tokens/s   tokens read    cache size")
+    for row in rows:
+        print(row)
+    width, layers = model.config.width, model.config.layers
+    print(f"The same tokens both ways: {'yes' if runs[0] == runs[1] else 'NO'}.")
+    print(f"The cache keeps 2 (a key and a value) x {layers} blocks x {width} numbers x 4 bytes = "
+          f"{2 * layers * width * 4:,} bytes per token.")
+    written = []
+    for token in runs[1]:
+        if token != end:
+            written.append(token)
+    print(f"\n{tokenizer.decode(prompt[1:] + written)}")
+
+
 def _write(args: argparse.Namespace) -> None:
     tokenizer = _load_tokenizer()
     if args.model == "gpt":
@@ -435,6 +474,9 @@ def main() -> None:
     model.set_defaults(run=_model)
     training = commands.add_parser("train", help="train the GPT, then score it against the pair counts")
     training.set_defaults(run=_train)
+    cache = commands.add_parser("cache", help="the GPT writes with the KV cache off, then on: speed and size")
+    cache.add_argument("--tokens", type=_whole_number, default=100, help="the most new tokens (default: %(default)s)")
+    cache.set_defaults(run=_cache)
     write = commands.add_parser("write", help="the chances under each sampler setting, then the decode loop writes")
     write.add_argument("--model", choices=["counts", "gpt"], default="counts",
                        help="the pair counts from step 4, or the GPT from step 9 (default: %(default)s)")
